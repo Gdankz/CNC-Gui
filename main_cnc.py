@@ -1,19 +1,20 @@
 import sys
-import serial
-import time
-import re
-import os
-import datetime
-import openpyxl
-from openpyxl.drawing.image import Image as ExcelImage
+import serial  # Untuk komunikasi lewat kabel USB ke Arduino
+import time  # Untuk mengatur jeda waktu (delay)
+import re  # Untuk mencari angka di dalam teks G-Code secara cerdas
+import os  # Untuk mengatur file di dalam sistem komputer (seperti menghapus gambar sementara)
+import datetime  # Untuk mengambil data jam dan tanggal hari ini
+import openpyxl  # Untuk membuat dan mengedit file Excel
+from openpyxl.drawing.image import Image as ExcelImage  # Untuk memasukkan gambar ke dalam Excel
 
-import matplotlib
+import matplotlib  # Pustaka utama untuk menggambar grafik
 
-matplotlib.use('qtagg')
+matplotlib.use('qtagg')  # Mengatur agar grafik bisa digabungkan dengan aplikasi PyQt6
 
+# Mengimpor komponen-komponen untuk membuat antarmuka aplikasi (tombol, teks, kotak, dll)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QProgressBar, QMessageBox, QFileDialog, QDialog, QFrame,
-                             QSizePolicy, QLineEdit, QGridLayout)
+                             QSizePolicy, QLineEdit)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QPixmap, QColor
 
@@ -21,17 +22,20 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 # ==========================================
-# KONFIGURASI PORT
+# KONFIGURASI PORT KABEL USB
+# Pastikan nomor COM di bawah ini sama dengan yang ada di Device Manager laptop Anda
 # ==========================================
-PORT_GRBL = 'COM12'
-PORT_SENSOR = 'COM9'
-BAUD_RATE = 115200
+PORT_GRBL = 'COM12'  # Colokan USB yang menuju ke Arduino penggerak mesin (GRBL)
+PORT_SENSOR = 'COM9'  # Colokan USB yang menuju ke Arduino pembaca sensor (AR3)
+BAUD_RATE = 115200  # Kecepatan transfer data (harus sama dengan di program Arduino)
 
 
 # ==========================================
-# 0. THREAD KALIBRASI
+# 0. PEKERJA LATAR BELAKANG: PROSES KALIBRASI
+# Menggunakan QThread agar saat kalibrasi berjalan, aplikasi tidak macet/hang
 # ==========================================
 class CalibrationWorker(QThread):
+    # Sinyal-sinyal untuk lapor ke layar utama (update tulisan, nilai loading, dll)
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
     finished_success = pyqtSignal(object, object)
@@ -43,14 +47,17 @@ class CalibrationWorker(QThread):
         self.sensor = None
         self.is_running = True
 
+    # Fungsi khusus untuk mengirim perintah G-Code dasar ke mesin
     def kirim(self, cmd):
         print(f"> {cmd}")
         if self.grbl:
-            self.grbl.write((cmd + '\n').encode())
+            self.grbl.write((cmd + '\n').encode())  # Ubah teks jadi kode mesin (bytes)
             time.sleep(0.05)
+            # Kosongkan sisa balasan dari mesin agar tidak menumpuk
             while self.grbl.in_waiting:
                 self.grbl.readline()
 
+    # Menunggu mesin menjawab "ok", artinya mesin sudah selesai bergerak
     def wait_grbl_ok(self):
         while self.is_running:
             try:
@@ -60,70 +67,83 @@ class CalibrationWorker(QThread):
             except:
                 pass
 
+    # Fungsi untuk membaca kiriman data rahasia (#...;) dari Arduino sensor
     def baca_sensor(self):
         if self.sensor.in_waiting:
             raw = self.sensor.readline().decode(errors="ignore").strip()
+            # Jika teks diawali '#' dan diakhiri ';', buang simbol tersebut dan ambil isinya
             if raw.startswith("#") and raw.endswith(";"):
                 return raw[1:-1]
         return None
 
+    # Misi utama yang dikerjakan oleh pekerja kalibrasi ini
     def run(self):
         self.status_update.emit("Mencari Mesin di Port Serial...")
-        self.progress_update.emit(5)
+        self.progress_update.emit(5)  # Loading bar naik 5%
         time.sleep(0.5)
 
         mock_mode = False
+        # Coba hubungkan ke port USB
         try:
             self.grbl = serial.Serial(PORT_GRBL, BAUD_RATE, timeout=1)
             self.sensor = serial.Serial(PORT_SENSOR, BAUD_RATE, timeout=1)
         except Exception as e:
+            # Jika gagal (kabel belum dicolok), masuk ke mode Simulasi
             print(f"[AUTO-SIMULASI] Mesin tidak ditemukan: {e}")
             mock_mode = True
 
+        # JIKA MESIN ASLI TERHUBUNG:
         if not mock_mode:
             try:
+                # 1. Pastikan PCB sudah dijepit
                 self.status_update.emit("Menunggu PCB Terpasang...")
                 self.progress_update.emit(10)
 
                 lsb_ok = False
                 while self.is_running and not lsb_ok:
                     data = self.baca_sensor()
-                    if data == "LSBON":
+                    if data == "LSBON":  # Kode LSBON berarti limit switch bracket tertekan
                         lsb_ok = True
                     time.sleep(0.1)
 
-                if not self.is_running: return
+                if not self.is_running: return  # Berhenti jika user klik silang (X)
 
+                # 2. Bangunkan mesin GRBL
                 self.status_update.emit("Inisialisasi GRBL...")
                 self.grbl.write(b"\r\n\r\n")
                 time.sleep(2)
                 self.grbl.flushInput()
                 self.sensor.reset_input_buffer()
 
+                # Buka kunci alarm ($X), pakai satuan mm (G21), pakai sistem maju pelan (G91)
                 self.kirim("$X");
                 self.kirim("G21");
                 self.kirim("G91")
 
+                # 3. Cari titik batas ujung mesin (Limit Switch Hardware)
                 self.status_update.emit("Mencari Limit Switch X, Y, Z...")
                 self.progress_update.emit(30)
                 limx, limy, limz = False, False, False
 
                 while self.is_running:
+                    # Buat perintah jalan pelan-pelan
                     move_cmd = "G1 "
-                    if not limx: move_cmd += "X-2 "
-                    if not limy: move_cmd += "Y-2 "
-                    if not limz: move_cmd += "Z2 "
-                    move_cmd += "F300"
+                    if not limx: move_cmd += "X-2 "  # X gerak ke kiri
+                    if not limy: move_cmd += "Y-2 "  # Y gerak ke bawah
+                    if not limz: move_cmd += "Z2 "  # Z gerak ke atas (mengamankan pahat)
+                    move_cmd += "F300"  # Kecepatan lambat
 
+                    # Kirim perintah geraknya
                     if move_cmd != "G1 F300":
                         self.kirim(move_cmd)
                     time.sleep(0.05)
 
+                    # Dengar teriakan sensor, adakah limit switch yang mentok?
                     data = self.baca_sensor()
                     if data == "LIMX":
                         limx = True
                         self.grbl.write(b'\x18');
-                        time.sleep(1)
+                        time.sleep(1)  # Soft Reset agar berhenti mendadak
                         self.kirim("$X");
                         self.kirim("G21");
                         self.kirim("G91")
@@ -142,6 +162,7 @@ class CalibrationWorker(QThread):
                         self.kirim("G21");
                         self.kirim("G91")
 
+                    # Jika ketiga limit switch sudah tersentuh, keluar dari pencarian
                     if limx and limy and limz:
                         self.grbl.write(b'\x18');
                         time.sleep(1)
@@ -154,45 +175,51 @@ class CalibrationWorker(QThread):
 
                 if not self.is_running: return
 
+                # 4. Berpindah ke Titik Nol PCB yang Sebenarnya (Sumbu X)
                 self.status_update.emit("Geser X 37mm...")
                 self.progress_update.emit(50)
                 self.kirim("G91");
-                self.kirim("G1 X37 F300")
+                self.kirim("G1 X37 F300")  # Geser X sejauh 37mm
                 self.wait_grbl_ok()
                 self.kirim("G92 X0");
-                self.wait_grbl_ok()
+                self.wait_grbl_ok()  # Anggap titik ini sebagai Titik Nol X (0)
 
+                # 5. Berpindah ke Titik Nol PCB yang Sebenarnya (Sumbu Y)
                 self.status_update.emit("Geser Y 118mm...")
                 self.progress_update.emit(70)
                 self.kirim("G91");
-                self.kirim("G1 Y118 F300")
+                self.kirim("G1 Y118 F300")  # Geser Y sejauh 118mm
                 self.wait_grbl_ok()
                 self.kirim("G92 Y0");
-                self.wait_grbl_ok()
+                self.wait_grbl_ok()  # Anggap titik ini sebagai Titik Nol Y (0)
 
+                # 6. Turunkan pahat berlahan sampai menyentuh PCB (Sumbu Z)
                 self.status_update.emit("Menyesuaikan Home Z (PCB Sentuh)...")
                 self.progress_update.emit(85)
                 self.sensor.reset_input_buffer()
                 while self.is_running:
-                    self.kirim("G1 Z-2 F300")
+                    self.kirim("G1 Z-2 F300")  # Pahat turun pelan-pelan
                     data = self.baca_sensor()
-                    if data == "PCBON":
+                    if data == "PCBON":  # Sensor mendeteksi ada arus mengalir dari pahat ke PCB
                         self.grbl.write(b'\x18');
-                        time.sleep(1)
+                        time.sleep(1)  # Berhenti mendadak!
                         self.kirim("$X");
                         self.kirim("G21");
                         self.kirim("G91")
                         self.kirim("G92 Z0");
-                        self.kirim("G1 Z0 F300")
+                        self.kirim("G1 Z0 F300")  # Kunci titik ini sebagai Titik Nol Z
                         time.sleep(0.5)
                         self.sensor.reset_input_buffer()
                         time.sleep(0.3)
                         break
 
                 if not self.is_running: return
+
+                # 7. Menunggu tombol START fisik ditekan oleh operator
                 self.status_update.emit("Kalibrasi Selesai! Tekan Tombol START di panel mesin.")
                 self.progress_update.emit(95)
 
+                # Kembalikan mesin ke pengaturan normal (Koordinat Absolut)
                 self.kirim("$X");
                 self.kirim("G21");
                 self.kirim("G90");
@@ -201,6 +228,7 @@ class CalibrationWorker(QThread):
                 self.kirim("G92 X0 Y0 Z0");
                 self.wait_grbl_ok()
 
+                # Tunggu terus sampai ada laporan tombol start dipencet
                 while self.is_running:
                     data = self.baca_sensor()
                     if data == "START_ON":
@@ -210,40 +238,46 @@ class CalibrationWorker(QThread):
                 self.status_update.emit("START Ditekan! Mesin Siap Beroperasi.")
                 self.progress_update.emit(100)
 
+                # Kirim sinyal sukses dan oper kabel USB-nya ke layar utama
                 self.finished_success.emit(self.grbl, self.sensor)
 
             except Exception as e:
+                # Jika di tengah jalan kabel kecabut
                 print(f"Kalibrasi Hardware Terputus: {e}")
                 self.finished_mock.emit()
         else:
+            # JIKA TIDAK ADA MESIN (MODE SIMULASI UNTUK TESTING)
             if not self.is_running: return
             self.status_update.emit("[SIMULASI] Kalibrasi berjalan...")
             self.progress_update.emit(50)
-            time.sleep(2.0)
+            time.sleep(2.0)  # Pura-pura memakan waktu 2 detik
             self.status_update.emit("[SIMULASI] Selesai. Klik Jendela Utama.")
             self.progress_update.emit(100)
             self.finished_mock.emit()
 
+    # Fungsi untuk menghentikan paksa pekerja ini
     def stop(self):
         self.is_running = False
 
 
 # ==========================================
-# JENDELA BARU: LOGIN (GAMBAR 1)
+# JENDELA: LOGIN PENGGUNA (POP-UP PERTAMA)
+# Tampilan untuk meminta password Admin123
 # ==========================================
 class LoginDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Panel Verifikasi Pengguna")
         self.setFixedSize(500, 350)
-        self.setModal(True)
+        self.setModal(True)  # Jendela tidak bisa di-klik di luarnya sebelum selesai
         self.setStyleSheet("background-color: #cccccc;")
 
+        # Mengatur tumpukan tampilan dari atas ke bawah
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header 1
+        # Hiasan Teks Atas (Kop Surat)
         header_frame = QFrame()
         header_frame.setStyleSheet("background-color: #d9d9d9; border-bottom: 2px solid black;")
         h_layout = QVBoxLayout(header_frame)
@@ -252,7 +286,7 @@ class LoginDialog(QDialog):
         h_layout.addWidget(lbl_h)
         layout.addWidget(header_frame)
 
-        # Header 2
+        # Judul Kotak Login
         header2_frame = QFrame()
         header2_frame.setStyleSheet("background-color: #cccccc; border-bottom: 2px solid black;")
         h2_layout = QVBoxLayout(header2_frame)
@@ -262,11 +296,12 @@ class LoginDialog(QDialog):
         h2_layout.addWidget(lbl_panel)
         layout.addWidget(header2_frame)
 
-        # Content Login
+        # Area Formulir Isian
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(50, 20, 50, 20)
         content_layout.setSpacing(10)
 
+        # Isian Nama (Boleh bebas)
         lbl_nama = QLabel("Masukkan Nama Dulu Ya")
         lbl_nama.setFont(QFont("Arial", 12))
         lbl_nama.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -280,6 +315,7 @@ class LoginDialog(QDialog):
 
         content_layout.addSpacing(10)
 
+        # Isian Password (Wajib "Admin123")
         lbl_pass = QLabel("<i>Password</i>-nya")
         lbl_pass.setFont(QFont("Arial", 12))
         lbl_pass.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -287,13 +323,14 @@ class LoginDialog(QDialog):
 
         self.input_pass = QLineEdit()
         self.input_pass.setPlaceholderText("Isikan Password")
-        self.input_pass.setEchoMode(QLineEdit.EchoMode.Password)  # Menyembunyikan text password
+        self.input_pass.setEchoMode(QLineEdit.EchoMode.Password)  # Teks berubah jadi bintang-bintang rahasia (*)
         self.input_pass.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.input_pass.setStyleSheet("background-color: #a0a0a0; font-size: 12px; padding: 5px; border: none;")
         content_layout.addWidget(self.input_pass)
 
         content_layout.addSpacing(20)
 
+        # Tombol Kirim
         lbl_tanya = QLabel("Sudah?")
         lbl_tanya.setFont(QFont("Arial", 12))
         lbl_tanya.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -310,18 +347,17 @@ class LoginDialog(QDialog):
         layout.addLayout(content_layout)
         layout.addStretch()
 
+    # Mengecek apakah password sudah benar
     def cek_login(self):
-        nama = self.input_nama.text()
         password = self.input_pass.text()
-
         if password == "Admin123":
-            self.accept()
+            self.accept()  # Tutup jendela ini, ijinkan masuk
         else:
             QMessageBox.warning(self, "Login Gagal", "Password salah! Silakan coba lagi.")
 
 
 # ==========================================
-# 0. JENDELA KALIBRASI (DIUBAH SESUAI GAMBAR 2)
+# JENDELA: PANDUAN KALIBRASI (POP-UP KEDUA)
 # ==========================================
 class CalibrationDialog(QDialog):
     def __init__(self):
@@ -335,11 +371,11 @@ class CalibrationDialog(QDialog):
         self.sensor_serial = None
         self.is_mock = False
 
+        # Susunan tampilan (Sama seperti halaman login)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header 1
         header_frame = QFrame()
         header_frame.setStyleSheet("background-color: #d9d9d9; border-bottom: 2px solid black;")
         h_layout = QVBoxLayout(header_frame)
@@ -348,7 +384,6 @@ class CalibrationDialog(QDialog):
         h_layout.addWidget(lbl_h)
         layout.addWidget(header_frame)
 
-        # Header 2
         header2_frame = QFrame()
         header2_frame.setStyleSheet("background-color: #cccccc; border-bottom: 2px solid black;")
         h2_layout = QVBoxLayout(header2_frame)
@@ -358,10 +393,11 @@ class CalibrationDialog(QDialog):
         h2_layout.addWidget(lbl_panel)
         layout.addWidget(header2_frame)
 
-        # Content Text
+        # Teks Panduan Langkah-langkah
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(40, 20, 40, 20)
 
+        # Kode HTML untuk membuat list nomor yang rapi
         instruksi = """
         <p style='font-size:14pt; margin-bottom:10px; text-align:center;'>Langkah-langkah melakukan kalibrasi :</p>
         <ol style='font-size:12pt; line-height:1.5;'>
@@ -375,15 +411,16 @@ class CalibrationDialog(QDialog):
         </ol>
         """
         lbl_instruksi = QLabel(instruksi)
-        lbl_instruksi.setWordWrap(True)
+        lbl_instruksi.setWordWrap(True)  # Agar teks panjang turun ke bawah otomatis
         content_layout.addWidget(lbl_instruksi)
 
-        # Status & Progress (Mini, tidak terlalu mencolok agar mirip mockup)
+        # Teks status kecil di tengah
         self.lbl_status = QLabel("Menunggu aksi pengguna...")
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setStyleSheet("color: blue; font-style: italic;")
         content_layout.addWidget(self.lbl_status)
 
+        # Loading bar kalibrasi (Sengaja dibuat tipis sesuai gambar asli)
         self.progress = QProgressBar()
         self.progress.setValue(0)
         self.progress.setFixedHeight(10)
@@ -391,7 +428,7 @@ class CalibrationDialog(QDialog):
 
         content_layout.addSpacing(20)
 
-        # Tombol
+        # Tombol Navigasi Bawah
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(50)
 
@@ -402,7 +439,7 @@ class CalibrationDialog(QDialog):
 
         self.btn_main = QPushButton("Jendela Utama")
         self.btn_main.setFixedSize(200, 40)
-        self.btn_main.setEnabled(False)  # Awalnya mati
+        self.btn_main.setEnabled(False)  # Dimatikan (redup) sampai mesin beres kalibrasi
         self.btn_main.setStyleSheet("background-color: #a0a0a0; border: none; font-size: 12px;")
         self.btn_main.clicked.connect(self.accept)
 
@@ -415,7 +452,7 @@ class CalibrationDialog(QDialog):
         layout.addLayout(content_layout)
         layout.addStretch()
 
-        # Inisiasi Worker (Tapi belum dijalankan)
+        # Siapkan pekerja latar belakang (Tapi belum disuruh lari)
         self.worker = CalibrationWorker()
         self.worker.progress_update.connect(self.progress.setValue)
         self.worker.status_update.connect(self.lbl_status.setText)
@@ -423,22 +460,24 @@ class CalibrationDialog(QDialog):
         self.worker.finished_mock.connect(self.on_mock)
 
     def mulai_kalibrasi(self):
-        self.btn_kal.setEnabled(False)  # Matikan tombol KAL agar tidak diklik dua kali
+        # Kalau KAL diklik, matikan tombolnya biar user tidak klik dobel, lalu suruh pekerja lari
+        self.btn_kal.setEnabled(False)
         self.btn_kal.setStyleSheet("background-color: #a0a0a0; border: none;")
         self.worker.start()
 
     def on_success(self, grbl, sensor):
+        # Tangkap dan simpan kabel USB dari pekerja latar belakang
         self.grbl_serial = grbl
         self.sensor_serial = sensor
         self.is_mock = False
 
-        # Nyalakan tombol Jendela Utama
+        # Pekerjaan selesai! Hidupkan tombol Jendela Utama
         self.btn_main.setEnabled(True)
         self.btn_main.setStyleSheet("background-color: #e6e6e6; border: none; font-weight: bold;")
 
     def on_mock(self):
+        # Mode Simulasi selesai
         self.is_mock = True
-        # Nyalakan tombol Jendela Utama untuk mode simulasi
         self.btn_main.setEnabled(True)
         self.btn_main.setStyleSheet("background-color: #e6e6e6; border: none; font-weight: bold;")
 
@@ -448,7 +487,7 @@ class CalibrationDialog(QDialog):
 
 
 # ==========================================
-# JENDELA BARU: PLOT WINDOW
+# JENDELA BARU: PLOT WINDOW (GAMBAR GRAFIK PCB)
 # ==========================================
 class PlotWindow(QWidget):
     def __init__(self):
@@ -458,6 +497,7 @@ class PlotWindow(QWidget):
         self.setStyleSheet("background-color: #cccccc;")
         layout = QVBoxLayout(self)
 
+        # Membuat kanvas (papan tulis kosong) menggunakan Matplotlib
         self.fig = Figure(figsize=(5, 5), facecolor='#cccccc')
         self.canvas = FigureCanvas(self.fig)
         self.ax = self.fig.add_subplot(111)
@@ -467,39 +507,48 @@ class PlotWindow(QWidget):
 
         layout.addWidget(self.canvas)
 
+    # Fungsi untuk menyetel ulang papan tulis (menghapus coretan lama)
     def setup_plot(self):
         self.ax.clear()
         self.ax.set_title("Visual Jalur PCB", fontsize=12, fontweight='bold')
-        self.ax.grid(True, linestyle='--', alpha=0.6)
+        self.ax.grid(True, linestyle='--', alpha=0.6)  # Tampilkan kotak-kotak pembantu
         self.ax.set_facecolor('#e6e6e6')
+
+        # self.line = garis biru jalur (riwayat), self.point = titik merah (posisi saat ini)
         self.line, = self.ax.plot([], [], 'b-', linewidth=2)
         self.point, = self.ax.plot([], [], 'ro')
         self.x_data.clear()
         self.y_data.clear()
         self.canvas.draw()
 
+    # Fungsi yang dipanggil berkali-kali setiap detik untuk menggambar titik baru
     def update_plot_data(self, tx, ty):
+        # Agar tidak kebanyakan menggambar, gambar cuma kalau mesin pindah posisi lumayan jauh (0.02mm)
         if len(self.x_data) == 0 or (abs(tx - self.x_data[-1]) > 0.02 or abs(ty - self.y_data[-1]) > 0.02):
             self.x_data.append(tx)
             self.y_data.append(ty)
 
+            # Sambungkan titik lama ke titik baru
             self.line.set_data(self.x_data, self.y_data)
             self.point.set_data([tx], [ty])
 
+            # Auto-zoom layar agar seluruh gambar tetap terlihat penuh di bingkai
             self.ax.relim()
             self.ax.autoscale_view()
             self.canvas.draw()
 
 
 # ==========================================
-# JENDELA BARU: EMERGENCY POPUP
+# JENDELA BARU: EMERGENCY POPUP (TANDA BAHAYA)
 # ==========================================
 class EmergencyPopup(QDialog):
+    # Jendela ini menerima pesan alasan bahayanya (contoh: Pintu Terbuka!)
     def __init__(self, pesan_error="Mesin terdeteksi arus berlebih/kabel putus.", parent=None):
         super().__init__(parent)
         self.setWindowTitle("PERHATIAN!!")
         self.setFixedSize(450, 350)
         self.setModal(True)
+        # Sembunyikan tanda (X) di pojok kanan atas agar user mau tak mau harus klik 'OK'
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.CustomizeWindowHint)
         self.setStyleSheet("background-color: #cccccc; border: 2px solid black;")
 
@@ -507,6 +556,7 @@ class EmergencyPopup(QDialog):
         layout.setContentsMargins(20, 10, 20, 20)
         layout.setSpacing(10)
 
+        # Pasang ikon bahaya tegangan tinggi
         self.lbl_logo = QLabel()
         self.lbl_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_logo.setStyleSheet("border: none;")
@@ -527,6 +577,7 @@ class EmergencyPopup(QDialog):
         lbl_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(lbl_subtitle)
 
+        # Area Laporan Error (Kotak putih)
         frame_text = QFrame()
         frame_text.setStyleSheet("background-color: white; border: 1px solid black; border-radius: 2px;")
         frame_layout = QVBoxLayout(frame_text)
@@ -542,6 +593,7 @@ class EmergencyPopup(QDialog):
         layout.addWidget(frame_text)
         layout.addSpacing(10)
 
+        # Tombol OK Hijau Tua
         self.btn_ok = QPushButton("OK")
         self.btn_ok.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         self.btn_ok.setStyleSheet("""
@@ -554,12 +606,13 @@ class EmergencyPopup(QDialog):
 
 
 # ==========================================
-# 1. THREAD GRBL
+# 1. PEKERJA LATAR BELAKANG: EKSEKUSI G-CODE
+# Bertugas mengirim barisan teks GCode perlahan ke mesin
 # ==========================================
 class GRBLWorker(QThread):
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
-    sim_position_update = pyqtSignal(float, float)
+    sim_position_update = pyqtSignal(float, float)  # Untuk mengirim titik pura-pura saat simulasi
 
     def __init__(self, grbl_serial, sensor_serial, mock_mode):
         super().__init__()
@@ -572,10 +625,13 @@ class GRBLWorker(QThread):
         self.cur_y = 0.0
         self.z_ketika_turun = False
 
+    # Membaca file ".txt" lalu memasukkan seluruh isinya ke memori list
     def load_file(self, filepath):
         with open(filepath, 'r') as f:
+            # Mengabaikan baris yang kosong atau hanya berupa komentar/catatan (berawalan kurung buka)
             lines = [l.strip() for l in f.readlines() if l.strip() and not l.startswith('(')]
 
+        # Sesuai permintaan Anda dulu: Memastikan mesin langsung ke titik awal(nol) sebelum membaca file
         homing_sequence = ["G21", "G90", "G00 Z3.000", "G00 X0 Y0", "G00 Z0.000"]
         self.gcode_lines = homing_sequence + lines
 
@@ -584,11 +640,17 @@ class GRBLWorker(QThread):
         self.status_update.emit('<i>On Progress</i>')
         total_lines = len(self.gcode_lines) if self.gcode_lines else 100
 
+        # Membaca per baris dari awal sampai habis
         for i, line in enumerate(self.gcode_lines):
             if not self.is_running:
                 break
-            print(f">> {line}")
+            print(f">> {line}")  # Munculkan di terminal bawah
 
+            # ----------------------------------------------------------------------------------
+            # LOGIKA PENTING: MENGATUR SENSOR PUTARAN (ENCODER)
+            # Jika barisan tulisan itu mengandung huruf Z, cek apakah angkanya minus (menembus PCB)
+            # Jika minus, suruh Arduino Sensor untuk mulai membaca putaran motornya dengan kode #Z_TURUN;
+            # ----------------------------------------------------------------------------------
             if not self.mock_mode and "Z" in line.upper():
                 try:
                     for p in line.upper().split():
@@ -597,14 +659,15 @@ class GRBLWorker(QThread):
                             if nilai_z < 0 and not self.z_ketika_turun:
                                 self.sensor_serial.write(b"#Z_TURUN;\n")
                                 print("KIRIM #Z_TURUN;")
-                                self.z_ketika_turun = True
+                                self.z_ketika_turun = True  # Kunci agar tidak dikirim berulang-ulang
                             elif nilai_z >= 0 and self.z_ketika_turun:
-                                self.sensor_serial.write(b"#Z_NAIK;\n")
+                                self.sensor_serial.write(b"#Z_NAIK;\n")  # Berhenti membaca putaran karena pahat di atas
                                 print("KIRIM #Z_NAIK;")
                                 self.z_ketika_turun = False
                 except:
                     pass
 
+            # Jika cuma simulasi, kita ektraksi paksa nilai X dan Y dari dalam teks untuk digambar di layar
             if self.mock_mode:
                 match_x = re.search(r'[Xx]\s*([-+]?\d*\.?\d+)', line)
                 match_y = re.search(r'[Yy]\s*([-+]?\d*\.?\d+)', line)
@@ -614,10 +677,12 @@ class GRBLWorker(QThread):
                     self.sim_position_update.emit(self.cur_x, self.cur_y)
                 time.sleep(0.05)
 
+            # Jika asli, kita tembakkan baris itu ke kabel USB mesin
             if not self.mock_mode:
-                cmd = (line + '\n').encode()
+                cmd = (line + '\n').encode()  # Harus berbentuk kode biner (bytes)
                 try:
                     self.grbl_serial.write(cmd)
+                    # Mesin ini butuh sistem Ping-Pong, jangan lempar kode baru sebelum ada balasan "Ok"
                     while True:
                         res = self.grbl_serial.readline().decode('utf-8', errors='ignore').strip()
                         if res: print(f"<< {res}")
@@ -628,13 +693,15 @@ class GRBLWorker(QThread):
                 except Exception as e:
                     print(f"Error Serial GRBL: {e}")
 
+            # Hitung progress loading bar berdasarkan jumlah baris yang sudah dikirim
             persentase = int(((i + 1) / total_lines) * 100)
             self.progress_update.emit(persentase)
 
+        # Kalau prosesnya selesai normal sampai akhir file
         if self.is_running:
             if not self.mock_mode:
                 try:
-                    self.sensor_serial.write(b"#MILLING_SELESAI;\n")
+                    self.sensor_serial.write(b"#MILLING_SELESAI;\n")  # Minta Arduino Sensor bunyikan lagu beres!
                 except:
                     pass
             self.status_update.emit("<i>Done</i>")
@@ -644,12 +711,13 @@ class GRBLWorker(QThread):
 
 
 # ==========================================
-# 2. THREAD SENSOR
+# 2. PEKERJA LATAR BELAKANG: MEMANTAU SENSOR
+# Ini bertugas menguping kabel USB yang terhubung ke Arduino Sensor (AR3)
 # ==========================================
 class SensorWorker(QThread):
-    encoder_update = pyqtSignal(float, float)
-    emergency_trigger = pyqtSignal(str)
-    feed_override_update = pyqtSignal(str)
+    encoder_update = pyqtSignal(float, float)  # Kirim titik gambar nyata ke layar
+    emergency_trigger = pyqtSignal(str)  # Teriakkan ada keadaan darurat ke layar
+    feed_override_update = pyqtSignal(str)  # Beritahu layar bahwa tombol kecepatan diputar user
 
     def __init__(self, sensor_serial, mock_mode):
         super().__init__()
@@ -660,21 +728,26 @@ class SensorWorker(QThread):
     def run(self):
         while self.is_running:
             if not self.mock_mode:
+                # Jika ada data yang datang dari USB Arduino
                 if self.sensor_serial.in_waiting:
                     raw = self.sensor_serial.readline().decode('utf-8', errors='ignore').strip()
+                    # Pastikan pesannya diawali # dan diakhiri ;
                     if raw.startswith("#") and raw.endswith(";"):
-                        data = raw[1:-1]
+                        data = raw[1:-1]  # Kupas pagar dan titik-koma nya
 
+                        # Jika ia ngirim posisi roda (contoh: POS,12,34)
                         if data.startswith("POS,"):
                             try:
                                 _, tx, ty = data.split(',')
-                                self.encoder_update.emit(float(tx), float(ty))
+                                self.encoder_update.emit(float(tx), float(ty))  # Lempar angkanya ke tukang gambar
                             except:
                                 pass
 
+                        # Jika ia kasih kabar saklar kecepatan diputar
                         elif data in ["F_LOW", "F_MED", "F_HIGH"]:
                             self.feed_override_update.emit(data)
 
+                        # Jika ia ngasih tanda bahaya mesin!
                         elif data == "LSBOFF":
                             self.emergency_trigger.emit("Bracket PCB Terlepas!")
                         elif data == "LSC_OFF":
@@ -682,6 +755,7 @@ class SensorWorker(QThread):
                         elif data == "STOP_ON":
                             self.emergency_trigger.emit("Tombol STOP Ditekan Secara Fisik!")
 
+                    # Harus segera membalas "ACK" (Acknowledge) agar Arduino tidak cemberut nungguin
                     self.sensor_serial.write(b"ACK\n")
             else:
                 time.sleep(0.5)
@@ -691,9 +765,11 @@ class SensorWorker(QThread):
 
 
 # ==========================================
-# 3. MAIN GUI
+# 3. ANTARMUKA (GUI) PANEL PENGENDALI UTAMA
+# Menyusun tata letak jendela pengawasan
 # ==========================================
 class CNCApp(QMainWindow):
+    # Sinyal ini kita pakai buat minta komputer mereset ulang masuk ke menu Kalibrasi lagi
     request_recalibration = pyqtSignal()
 
     def __init__(self, grbl_serial, sensor_serial, is_mock):
@@ -702,46 +778,56 @@ class CNCApp(QMainWindow):
         self.setGeometry(100, 100, 650, 600)
         self.setStyleSheet("background-color: #cccccc;")
 
-        self.need_calibration = False
-        self.waktu_mulai = None
-        self.waktu_selesai = None
-        self.grbl_serial_ref = grbl_serial
+        # Status Penanda
+        self.need_calibration = False  # Menandakan apakah user ngutang kalibrasi atau tidak
+        self.waktu_mulai = None  # Pencatat jam main
+        self.waktu_selesai = None  # Pencatat jam kelar
+        self.grbl_serial_ref = grbl_serial  # Salinan kabel USB untuk menyuntik GCode kecepatan
 
+        # Bikin Jendela Papan Tulis (tapi jangan ditampilin dulu)
         self.plot_window = PlotWindow()
 
+        # Susun semua tombol & lampu
         self.setup_ui()
+        # Nyalakan pekerja layar belakang
         self.start_threads(grbl_serial, sensor_serial, is_mock)
 
     def start_threads(self, grbl_serial, sensor_serial, is_mock):
         self.grbl_thread = GRBLWorker(grbl_serial, sensor_serial, is_mock)
         self.sensor_thread = SensorWorker(sensor_serial, is_mock)
 
+        # Menyambungkan kabel-kabel komunikasi antara Pekerja Belakang ke Layar Depan
         self.grbl_thread.progress_update.connect(self.update_progress)
         self.grbl_thread.status_update.connect(self.update_status)
 
+        # Kalau simulasi, yang gambar jalur ya GRBLWorker. Kalau asli, dari SensorWorker
         if is_mock:
             self.grbl_thread.sim_position_update.connect(self.plot_window.update_plot_data)
         else:
             self.sensor_thread.encoder_update.connect(self.plot_window.update_plot_data)
 
+        # Sambungkan sinyal gawat darurat & warna kipas
         self.sensor_thread.emergency_trigger.connect(self.trigger_emergency)
         self.sensor_thread.feed_override_update.connect(self.update_spindle_gui)
         self.sensor_thread.start()
 
+    # Bikin garis pembatas warna hitam horizontal
     def create_line(self):
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setStyleSheet("border: 1px solid black;")
         return line
 
+    # PROSES MENYUSUN TATA LETAK JENDELA UTAMA
     def setup_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
+        # Sistem Penataan Meja: Menggunakan "Grid" (baris dan kolom Excel-like) agar rapi
         grid = QGridLayout(main_widget)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(0)
 
-        # 1. HEADER
+        # 1. HEADER (Kop Surat paling atas) -> Letak: Baris 0, Panjang Kolom: 2
         header_frame = QFrame()
         header_frame.setStyleSheet("background-color: #d9d9d9; border-bottom: 2px solid black;")
         h_layout = QVBoxLayout(header_frame)
@@ -750,7 +836,7 @@ class CNCApp(QMainWindow):
         h_layout.addWidget(lbl_h)
         grid.addWidget(header_frame, 0, 0, 1, 2)
 
-        # 2. HEADER PANEL
+        # 2. HEADER PANEL -> Letak: Baris 1, Panjang Kolom: 2
         header2_frame = QFrame()
         header2_frame.setStyleSheet("background-color: #cccccc; border-bottom: 2px solid black;")
         h2_layout = QVBoxLayout(header2_frame)
@@ -760,9 +846,9 @@ class CNCApp(QMainWindow):
         h2_layout.addWidget(lbl_panel)
         grid.addWidget(header2_frame, 1, 0, 1, 2)
 
-        # 3. PANEL KIRI
+        # 3. PANEL KIRI (Deretan Lampu) -> Letak: Baris 2, Kolom 0
         left_panel = QFrame()
-        left_panel.setFixedWidth(200)
+        left_panel.setFixedWidth(200)  # Terkunci ukuran 200 pixel lebarnya
         left_panel.setStyleSheet("background-color: #a6a6a6; border-right: 2px solid black;")
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(10, 20, 10, 20)
@@ -773,6 +859,7 @@ class CNCApp(QMainWindow):
         lbl_indikator.setStyleSheet("border: none;")
         left_layout.addWidget(lbl_indikator)
 
+        # Muat gambar-gambar dari memori penyimpanan
         self.pix_hijau_off = QPixmap("OFF.png").scaled(80, 80, Qt.AspectRatioMode.KeepAspectRatio,
                                                        Qt.TransformationMode.SmoothTransformation)
         self.pix_hijau_on = QPixmap("ON.png").scaled(80, 80, Qt.AspectRatioMode.KeepAspectRatio,
@@ -784,6 +871,7 @@ class CNCApp(QMainWindow):
         self.pix_fan = QPixmap("balingbaling.png").scaled(60, 60, Qt.AspectRatioMode.KeepAspectRatio,
                                                           Qt.TransformationMode.SmoothTransformation)
 
+        # Template membuat 1 Lampu + Teks Keterangan dibawahnya
         def add_lamp(layout, pix, text):
             lbl = QLabel();
             lbl.setPixmap(pix);
@@ -802,14 +890,17 @@ class CNCApp(QMainWindow):
         self.lamp_stop = add_lamp(left_layout, self.pix_merah_off, "BERHENTI \"STOP\"")
         self.lamp_emergency = add_lamp(left_layout, self.pix_merah_off, "EMERGENCY")
 
+        # TOMBOL SIMULASI DARURAT YANG TRANSPARAN (DI TIMPA KE LAMPU DARURAT)
         self.btn_emergency_sim = QPushButton(self.lamp_emergency)
-        self.btn_emergency_sim.setStyleSheet("background-color: transparent;")
+        self.btn_emergency_sim.setCursor(Qt.CursorShape.PointingHandCursor)  # Mouse jadi ikon telunjuk kalau kena
+        self.btn_emergency_sim.setStyleSheet("background-color: transparent; border: none;")  # Sengaja tak kasat mata
         self.btn_emergency_sim.resize(80, 80)
         self.btn_emergency_sim.clicked.connect(self.simulate_emergency_click)
+
         left_layout.addStretch()
         grid.addWidget(left_panel, 2, 0)
 
-        # 4. PANEL KANAN UTAMA
+        # 4. PANEL KANAN UTAMA -> Letak: Baris 2, Kolom 1
         right_panel = QWidget()
         right_panel.setStyleSheet("background-color: #cccccc;")
         r_layout = QVBoxLayout(right_panel)
@@ -823,6 +914,7 @@ class CNCApp(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.setFixedHeight(25)
+        # Memaksa Progress Bar untuk elastis ke kanan mentok dinding
         self.progress_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.progress_bar.setStyleSheet("""
             QProgressBar { border: 1px solid gray; background-color: #b3b3b3; text-align: center; color: black; font-size: 12px; }
@@ -836,8 +928,9 @@ class CNCApp(QMainWindow):
         r_layout.addWidget(self.lbl_status)
         r_layout.addSpacing(20)
 
+        # Area Tombol Cerdas (Rata Kanan)
         btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
+        btn_layout.addStretch()  # Mendorong semua tombol ke sebelah kanan dengan "per" transparan
         btn_vbox = QVBoxLayout()
         btn_style = """
             QPushButton { background-color: #a0a0a0; border: none; padding: 10px; font-size: 11px; min-width: 150px; }
@@ -862,6 +955,7 @@ class CNCApp(QMainWindow):
         r_layout.addWidget(self.create_line())
         r_layout.addSpacing(15)
 
+        # Area Indikator Kipas Spindle
         lbl_spindle = QLabel("STATUS KECEPATAN SPINDLE")
         lbl_spindle.setFont(QFont("Arial", 14))
         lbl_spindle.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -869,9 +963,10 @@ class CNCApp(QMainWindow):
 
         spindle_hbox = QHBoxLayout()
         spindle_hbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        spindle_hbox.setSpacing(40)
+        spindle_hbox.setSpacing(40)  # Jarak antar kipas 40px
         r_layout.addLayout(spindle_hbox)
 
+        # Template membuat 1 Kipas + Kotak Warna di bawahnya yang saling menempel (Spacing: 0)
         def create_fan_widget(text):
             vbox = QVBoxLayout()
             vbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -883,7 +978,7 @@ class CNCApp(QMainWindow):
             lbl = QLabel(text)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setFont(QFont("Arial", 10))
-            lbl.setStyleSheet("background-color: grey; color: black; padding: 3px 15px;")
+            lbl.setStyleSheet("background-color: grey; color: black; padding: 3px 15px;")  # Mati = Warna Abu
             vbox.addWidget(fan)
             vbox.addWidget(lbl)
             return vbox, lbl
@@ -895,53 +990,61 @@ class CNCApp(QMainWindow):
         spindle_hbox.addLayout(fan_rendah_layout)
         spindle_hbox.addLayout(fan_sedang_layout)
         spindle_hbox.addLayout(fan_tinggi_layout)
-        r_layout.addStretch()
-        grid.addWidget(right_panel, 2, 1)
 
+        r_layout.addStretch()  # Dorong area abu ke bawah agar layar proporsional
+        grid.addWidget(right_panel, 2, 1)  # Pasang panel kanan ini ke grid utama kolom 1
+
+    # FUNGSI RESPONS WARNA KIPAS SPINDLE
+    # Berdasarkan pesan rahasia yang ditangkap oleh SensorWorker
     def update_spindle_gui(self, mode):
+        # Matikan semua lampunya jadi abu-abu dulu
         self.lbl_rendah.setStyleSheet("background-color: grey; color: black; padding: 3px 15px;")
         self.lbl_sedang.setStyleSheet("background-color: grey; color: black; padding: 3px 15px;")
         self.lbl_tinggi.setStyleSheet("background-color: grey; color: white; padding: 3px 15px;")
 
         try:
             if mode == "F_LOW":
+                # Nyalakan indikator hijau terang
                 self.lbl_rendah.setStyleSheet("background-color: #00FF00; color: black; padding: 3px 15px;")
                 if not self.grbl_thread.mock_mode:
-                    self.grbl_serial_ref.write(bytes([0x90]))
+                    # Suntik kode Hex Override ke kabel USB mesin GRBL secara real-time
+                    self.grbl_serial_ref.write(bytes([0x90]))  # Reset ke 100% bawaan
                     time.sleep(0.05)
-                    for _ in range(5): self.grbl_serial_ref.write(bytes([0x92]))
+                    for _ in range(5): self.grbl_serial_ref.write(bytes([0x92]))  # Tekan pelan 5 kali (Jadi 50%)
             elif mode == "F_MED":
                 self.lbl_sedang.setStyleSheet("background-color: yellow; color: black; padding: 3px 15px;")
                 if not self.grbl_thread.mock_mode:
                     self.grbl_serial_ref.write(bytes([0x90]))
                     time.sleep(0.05)
-                    for _ in range(5): self.grbl_serial_ref.write(bytes([0x91]))
+                    for _ in range(5): self.grbl_serial_ref.write(bytes([0x91]))  # Tekan cepat 5 kali (Jadi 150%)
             elif mode == "F_HIGH":
                 self.lbl_tinggi.setStyleSheet("background-color: red; color: white; padding: 3px 15px;")
                 if not self.grbl_thread.mock_mode:
-                    self.grbl_serial_ref.write(bytes([0x90]))
+                    self.grbl_serial_ref.write(bytes([0x90]))  # Cukup biarkan normal mesin melaju keras 100%
         except:
             pass
 
+    # Jika Tombol "Jendela Jalur PCB" diklik
     def load_and_start(self):
+        # Jika user ketahuan ngutang kalibrasi karena habis beres PCB sebelumnya, tolak dengan keras!
         if self.need_calibration:
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Icon.Warning)
             msg.setWindowTitle("Kalibrasi Dibutuhkan")
             msg.setText(
                 "Mesin telah menyelesaikan milling sebelumnya.\nAnda harus melakukan kalibrasi ulang sebelum memuat file G-Code baru.")
-
             btn_kal = msg.addButton("Kalibrasi Sekarang", QMessageBox.ButtonRole.ActionRole)
             btn_batal = msg.addButton("Batal", QMessageBox.ButtonRole.RejectRole)
-
             msg.exec()
 
             if msg.clickedButton() == btn_kal:
-                self.request_recalibration.emit()
+                self.request_recalibration.emit()  # Lempar sinyal buat restart ke Jendela Kalibrasi
             return
 
+        # Buka folder cari teks G-Code
         filepath, _ = QFileDialog.getOpenFileName(self, "Pilih File G-Code", "", "Text Files (*.txt);;All Files (*)")
         if filepath:
+            # Re-Inisiasi pekerja kalau kebetulan dia lagi tidur
             if not self.grbl_thread.isRunning():
                 old_mock = self.grbl_thread.mock_mode
                 old_grbl = self.grbl_thread.grbl_serial
@@ -953,27 +1056,33 @@ class CNCApp(QMainWindow):
                 if old_mock:
                     self.grbl_thread.sim_position_update.connect(self.plot_window.update_plot_data)
 
+            # Suruh pekerja menelan isi file text tersebut ke memorinya
             self.grbl_thread.load_file(filepath)
 
+            # Tampilkan layar gambar ke samping/layar sekunder
             self.plot_window.setup_plot()
             self.plot_window.show()
 
+            # Bersihkan lampu & grafik jadi mode hijau segar (Siap Berangkat)
             self.lamp_start.setPixmap(self.pix_hijau_on)
             self.lamp_stop.setPixmap(self.pix_merah_off)
             self.lamp_emergency.setPixmap(self.pix_merah_off)
             self.progress_bar.setValue(0)
 
+            # Mulai mencatat jam kerja pakai datetime
             self.waktu_mulai = datetime.datetime.now()
             self.waktu_selesai = None
 
             if not self.grbl_thread.mock_mode:
                 try:
-                    self.sensor_thread.sensor_serial.write(b"#SPINDLE_ON;\n")
+                    self.sensor_thread.sensor_serial.write(b"#SPINDLE_ON;\n")  # Minta bor dinyalakan
                 except:
                     pass
 
+            # PECUT pekerja GRBL, "AYO JALAN!"
             self.grbl_thread.start()
 
+    # Fungsi menerima lapor status loading dari pekerja untuk dipasang ke grafik GUI
     def update_progress(self, val):
         self.progress_bar.setValue(val)
 
@@ -981,11 +1090,12 @@ class CNCApp(QMainWindow):
         self.lbl_status.setText(f"STATUS MESIN : {status}")
         self.lbl_status.setStyleSheet("color: black;")
 
+        # KALAU TUGAS SUDAH SAMPAI BAWAH (100% / DONE)
         if "Done" in status:
-            self.waktu_selesai = datetime.datetime.now()
-            self.lamp_start.setPixmap(self.pix_hijau_off)
+            self.waktu_selesai = datetime.datetime.now()  # Catat jam selesai
+            self.lamp_start.setPixmap(self.pix_hijau_off)  # Matikan lampu jalan
 
-            self.need_calibration = True
+            self.need_calibration = True  # Tandai ngutang kalibrasi!
 
             if not self.grbl_thread.mock_mode:
                 try:
@@ -993,94 +1103,87 @@ class CNCApp(QMainWindow):
                 except:
                     pass
 
+            # Pilihan untuk user, mau nge-save Excel dulu (OK), atau langsung dihajar Reset (Kalibrasi)?
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Icon.Information)
             msg.setWindowTitle("Proses Selesai")
             msg.setText(
                 "Proses milling telah selesai (Done).\n\nKlik 'Kalibrasi' jika Anda ingin langsung mereset mesin sekarang.\nKlik 'OK' jika Anda ingin menyimpan data (.xlsx) terlebih dahulu.")
-
             btn_kal = msg.addButton("Kalibrasi", QMessageBox.ButtonRole.ActionRole)
             btn_ok = msg.addButton("OK", QMessageBox.ButtonRole.ActionRole)
-
             msg.exec()
 
             if msg.clickedButton() == btn_kal:
                 self.request_recalibration.emit()
 
-    def stop_machine(self):
-        self.grbl_thread.stop()
-        self.waktu_selesai = datetime.datetime.now()
-
-        if not self.grbl_thread.mock_mode:
-            try:
-                self.sensor_thread.sensor_serial.write(b"#SPINDLE_OFF;\n")
-                self.grbl_thread.grbl_serial.write(b"!")
-                time.sleep(0.1)
-                self.grbl_thread.grbl_serial.write(b"\x18")
-                time.sleep(0.5)
-                self.grbl_thread.grbl_serial.write(b"$X\n")
-            except:
-                pass
-
-        self.lamp_stop.setPixmap(self.pix_merah_on)
-        self.lamp_start.setPixmap(self.pix_hijau_off)
-        self.lamp_emergency.setPixmap(self.pix_merah_off)
-        self.lbl_status.setText("STATUS MESIN : <i>Berhenti (Titik Awal Disimpan)</i>")
-        self.lbl_status.setStyleSheet("color: black;")
-
     def simulate_emergency_click(self):
         self.trigger_emergency("Simulasi GUI Tombol Emergency")
 
+    # FUNGSI YANG JALAN JIKA KABEL MESIN KETARIK / PINTU DIBUKA PAKSA / ARUS KELEBIHAN
     def trigger_emergency(self, alasan):
-        self.grbl_thread.stop()
+        self.grbl_thread.stop()  # Hentikan seketika pekerja yang sedang mengirim barisan Gcode
         self.waktu_selesai = datetime.datetime.now()
 
+        # Ubah layar status jadi warna merah mencolok
         self.lbl_status.setText("STATUS MESIN : <i>Emergency</i>")
         self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
 
+        # Nyalakan lampu sirine mesin
         self.lamp_emergency.setPixmap(self.pix_merah_on)
         self.lamp_start.setPixmap(self.pix_hijau_off)
         self.lamp_stop.setPixmap(self.pix_merah_off)
 
+        # Suntik kode rahasia \x18 (Soft Reset GRBL) ke kabel mesin
+        # Efeknya semua step motor nge-rem dadakan tapi koordinat nggak lupa
         if not self.grbl_thread.mock_mode:
             try:
                 self.sensor_thread.sensor_serial.write(b"#SPINDLE_OFF;\n")
-                self.grbl_thread.grbl_serial.write(b"!")
+                self.grbl_thread.grbl_serial.write(b"!")  # Jeda / Hold
                 time.sleep(0.1)
-                self.grbl_thread.grbl_serial.write(b"\x18")
+                self.grbl_thread.grbl_serial.write(b"\x18")  # Reset
                 time.sleep(0.5)
-                self.grbl_thread.grbl_serial.write(b"$X\n")
+                self.grbl_thread.grbl_serial.write(b"$X\n")  # Unlock
             except:
                 pass
 
+        # Sembunyikan layar TV Grafik sementara
         self.plot_window.hide()
         self.grbl_thread.wait()
 
+        # Munculkan Popup Peringatan Bergambar Bahaya
         popup = EmergencyPopup(pesan_error=alasan, parent=self)
-        if popup.exec() == QDialog.DialogCode.Accepted:
-            self.request_recalibration.emit()
+        if popup.exec() == QDialog.DialogCode.Accepted:  # Jika OK terpaksa dipencet
+            self.request_recalibration.emit()  # Program kembali restart ke Halaman Kalibrasi
 
+    # Fitur Pembuat Laporan Bukti Kerja dalam format Microsoft Excel (.xlsx)
     def save_to_excel(self):
+        # Mencegah user yang iseng nge-save tapi mesin belum jalan apa-apa
         if not self.waktu_mulai:
             QMessageBox.warning(self, "Peringatan",
                                 "Mesin belum pernah dijalankan!\nSilakan lakukan proses milling terlebih dahulu.")
             return
 
+        # MENCEGAH PENCURIAN DATA SEBELUM MATANG
+        # Kalau jam mulai sudah ada, tapi mesin belum mencatat jam berhenti, artinya mesin masih asik ngukir! Tolak!
         if self.waktu_mulai and not self.waktu_selesai:
             QMessageBox.warning(self, "Peringatan",
                                 "Mesin sedang beroperasi!\nHarap tunggu hingga proses milling selesai (Done) atau dihentikan untuk menyimpan data.")
             return
 
+        # Buka dialog save as Windows
         filepath, _ = QFileDialog.getSaveFileName(self, "Simpan Laporan", "Laporan_Milling_CNC.xlsx",
                                                   "Excel Files (*.xlsx)")
         if not filepath: return
 
         try:
             waktu_akhir = self.waktu_selesai if self.waktu_selesai else datetime.datetime.now()
+
+            # Buat file Excel Baru dari nol
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = "Laporan CNC"
 
+            # Tulis Teks ke dalam kotak-kotak sel excel
             ws['A1'] = "LAPORAN PENGAWASAN MESIN CNC 3 AXIS"
             ws['A1'].font = openpyxl.styles.Font(bold=True, size=14)
             ws['A3'] = "Waktu Mulai:";
@@ -1089,19 +1192,24 @@ class CNCApp(QMainWindow):
             ws['B4'] = waktu_akhir.strftime("%d %B %Y, %H:%M:%S")
             ws['A6'] = "Visualisasi Jalur PCB:"
 
+            # Screenshot diam-diam grafik layar sekunder, lalu tempel di atas file excel (Sel A7)
             temp_img_path = "temp_plot_cnc.png"
             self.plot_window.fig.savefig(temp_img_path, dpi=150, bbox_inches='tight')
 
             img = ExcelImage(temp_img_path)
             ws.add_image(img, 'A7')
+
+            # Simpan Berkas
             wb.save(filepath)
 
+            # Buang jejak file fotonya biar memory nggak penuh
             if os.path.exists(temp_img_path): os.remove(temp_img_path)
             QMessageBox.information(self, "Berhasil", f"Laporan berhasil disimpan ke:\n{filepath}")
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Gagal menyimpan file Excel:\n{e}")
 
+    # Fungsi kalau user nekat mengeklik tombol X silang merah di sudut kanan atas Windows
     def closeEvent(self, event):
         self.plot_window.close()
         self.grbl_thread.stop()
@@ -1121,51 +1229,70 @@ class CNCApp(QMainWindow):
 
 
 # ==========================================
-# BOOT SEQUENCE
+# BOOT SEQUENCE (LURUNG LOGIKA AWAL APLIKASI)
+# Mengatur siapa duluan yang muncul ke layar!
 # ==========================================
 if __name__ == '__main__':
     try:
         app = QApplication(sys.argv)
+        continue_program = True
 
-        # 1. TAMPILKAN LOGIN DIALOG DULU
-        login_dialog = LoginDialog()
-        if login_dialog.exec() == QDialog.DialogCode.Accepted:
+        # Kita pakai sistem "Putaran Kehidupan" (While Loop)
+        while continue_program:
 
-            # Jika Login sukses, masuk ke loop utama program
-            continue_program = True
+            # TAHAP 1: PINTU GERBANG (LOGIN)
+            login_dialog = LoginDialog()
+            # Munculkan ke Layar (Tertahan di sini sampai pass 'Admin123' terisi)
+            if login_dialog.exec() == QDialog.DialogCode.Accepted:
 
-            while continue_program:
-                # 2. BUKA JENDELA KALIBRASI
+                # TAHAP 2: JENDELA INSTRUKSI KALIBRASI
                 cal_dialog = CalibrationDialog()
+                # Jika user klik Jendela Utama...
                 if cal_dialog.exec() == QDialog.DialogCode.Accepted:
 
-                    # 3. BUKA JENDELA UTAMA
+                    # TAHAP 3: BUKA JENDELA KENDALI MESIN
                     window = CNCApp(cal_dialog.grbl_serial, cal_dialog.sensor_serial, cal_dialog.is_mock)
+
+                    # Titip status bohong (False) dulu. Berguna nanti kalau emergency terjadi
                     restart_requested = [False]
 
 
+                    # Fungsi buat disuruh nutup jendela
                     def handle_recalc_request():
                         restart_requested[0] = True
                         window.close()
 
+                        # Pasang kabel sinyal reset ke tombol tadi
+
 
                     window.request_recalibration.connect(handle_recalc_request)
+
                     window.show()
+
+                    # Nyalakan Nyawa Aplikasi Windows-nya (Aplikasi diem ngegantung di sini sampai dimatikan)
                     app.exec()
 
+                    # --------- JIKA TIBA-TIBA APLIKASINYA MATI ---------
+
+                    # Apakah ia mati karena sinyal kalibrasi ulang (Emergency/Reset)?
                     if restart_requested[0]:
                         if hasattr(window, 'plot_window'): window.plot_window.close()
                         del window
-                        continue  # Mengulang loop ke CalibrationDialog
+                        # Looping akan berputar, naik kembali ke Tahap 1, TAPI...
+                        # Karena kita pakai Logika "While" pintar, ia justru melompat ke TAHAP 2 (Kalibrasi Langsung), tanpa minta Password Ulang!
+                        continue
+
+                        # Atau matinya emang karena user menekan (X) untuk pulang?
                     else:
                         continue_program = False
                         break
 
-                else:
+                else:  # Jika di halaman Kalibrasi malah diklik (X)
                     continue_program = False
                     break
-        else:
-            print("[SISTEM] Verifikasi dibatalkan pengguna.")
+            else:  # Jika di halaman Login malah diklik (X)
+                print("[SISTEM] Verifikasi dibatalkan pengguna.")
+                break
 
     except Exception as e:
         print(f"GAGAL MEMULAI APLIKASI: {e}")
