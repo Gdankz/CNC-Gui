@@ -13,7 +13,7 @@ matplotlib.use('qtagg')
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QProgressBar, QMessageBox, QFileDialog, QDialog, QFrame,
-                             QSizePolicy, QGridLayout)
+                             QSizePolicy, QLineEdit, QGridLayout)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QPixmap, QColor
 
@@ -220,7 +220,7 @@ class CalibrationWorker(QThread):
             self.status_update.emit("[SIMULASI] Kalibrasi berjalan...")
             self.progress_update.emit(50)
             time.sleep(2.0)
-            self.status_update.emit("[SIMULASI] Selesai. Klik OK untuk masuk Panel.")
+            self.status_update.emit("[SIMULASI] Selesai. Klik Jendela Utama.")
             self.progress_update.emit(100)
             self.finished_mock.emit()
 
@@ -228,66 +228,219 @@ class CalibrationWorker(QThread):
         self.is_running = False
 
 
+# ==========================================
+# JENDELA BARU: LOGIN (GAMBAR 1)
+# ==========================================
+class LoginDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Panel Verifikasi Pengguna")
+        self.setFixedSize(500, 350)
+        self.setModal(True)
+        self.setStyleSheet("background-color: #cccccc;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Header 1
+        header_frame = QFrame()
+        header_frame.setStyleSheet("background-color: #d9d9d9; border-bottom: 2px solid black;")
+        h_layout = QVBoxLayout(header_frame)
+        lbl_h = QLabel("🪶 Jendela GUI Sistem Pengawasan dan Keamanan Mesin CNC 3 Axis untuk Milling PCB")
+        lbl_h.setFont(QFont("Arial", 10))
+        h_layout.addWidget(lbl_h)
+        layout.addWidget(header_frame)
+
+        # Header 2
+        header2_frame = QFrame()
+        header2_frame.setStyleSheet("background-color: #cccccc; border-bottom: 2px solid black;")
+        h2_layout = QVBoxLayout(header2_frame)
+        lbl_panel = QLabel("PANEL VERIFIKASI PENGGUNA")
+        lbl_panel.setFont(QFont("Arial", 14))
+        lbl_panel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        h2_layout.addWidget(lbl_panel)
+        layout.addWidget(header2_frame)
+
+        # Content Login
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(50, 20, 50, 20)
+        content_layout.setSpacing(10)
+
+        lbl_nama = QLabel("Masukkan Nama Dulu Ya")
+        lbl_nama.setFont(QFont("Arial", 12))
+        lbl_nama.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        content_layout.addWidget(lbl_nama)
+
+        self.input_nama = QLineEdit()
+        self.input_nama.setPlaceholderText("Isikan Nama")
+        self.input_nama.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.input_nama.setStyleSheet("background-color: #a0a0a0; font-size: 12px; padding: 5px; border: none;")
+        content_layout.addWidget(self.input_nama)
+
+        content_layout.addSpacing(10)
+
+        lbl_pass = QLabel("<i>Password</i>-nya")
+        lbl_pass.setFont(QFont("Arial", 12))
+        lbl_pass.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        content_layout.addWidget(lbl_pass)
+
+        self.input_pass = QLineEdit()
+        self.input_pass.setPlaceholderText("Isikan Password")
+        self.input_pass.setEchoMode(QLineEdit.EchoMode.Password)  # Menyembunyikan text password
+        self.input_pass.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.input_pass.setStyleSheet("background-color: #a0a0a0; font-size: 12px; padding: 5px; border: none;")
+        content_layout.addWidget(self.input_pass)
+
+        content_layout.addSpacing(20)
+
+        lbl_tanya = QLabel("Sudah?")
+        lbl_tanya.setFont(QFont("Arial", 12))
+        lbl_tanya.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        content_layout.addWidget(lbl_tanya)
+
+        btn_ok = QPushButton("Klik Ok")
+        btn_ok.setStyleSheet("""
+            QPushButton { background-color: #e6e6e6; border: none; padding: 8px; font-size: 12px; }
+            QPushButton:hover { background-color: #d9d9d9; }
+        """)
+        btn_ok.clicked.connect(self.cek_login)
+        content_layout.addWidget(btn_ok)
+
+        layout.addLayout(content_layout)
+        layout.addStretch()
+
+    def cek_login(self):
+        nama = self.input_nama.text()
+        password = self.input_pass.text()
+
+        if password == "Admin123":
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Login Gagal", "Password salah! Silakan coba lagi.")
+
+
+# ==========================================
+# 0. JENDELA KALIBRASI (DIUBAH SESUAI GAMBAR 2)
+# ==========================================
 class CalibrationDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Proses Kalibrasi Mesin CNC")
-        self.setFixedSize(500, 250)
+        self.setFixedSize(650, 450)
         self.setModal(True)
+        self.setStyleSheet("background-color: #cccccc;")
 
         self.grbl_serial = None
         self.sensor_serial = None
         self.is_mock = False
 
-        layout = QVBoxLayout()
-        title = QLabel("SISTEM KALIBRASI MESIN CNC 3 AXIS")
-        title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        self.lbl_status = QLabel("Memulai Sistem...")
+        # Header 1
+        header_frame = QFrame()
+        header_frame.setStyleSheet("background-color: #d9d9d9; border-bottom: 2px solid black;")
+        h_layout = QVBoxLayout(header_frame)
+        lbl_h = QLabel("🪶 Jendela GUI Sistem Pengawasan dan Keamanan Mesin CNC 3 Axis untuk Milling PCB")
+        lbl_h.setFont(QFont("Arial", 10))
+        h_layout.addWidget(lbl_h)
+        layout.addWidget(header_frame)
+
+        # Header 2
+        header2_frame = QFrame()
+        header2_frame.setStyleSheet("background-color: #cccccc; border-bottom: 2px solid black;")
+        h2_layout = QVBoxLayout(header2_frame)
+        lbl_panel = QLabel("PROSES KALIBRASI")
+        lbl_panel.setFont(QFont("Arial", 14))
+        lbl_panel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        h2_layout.addWidget(lbl_panel)
+        layout.addWidget(header2_frame)
+
+        # Content Text
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(40, 20, 40, 20)
+
+        instruksi = """
+        <p style='font-size:14pt; margin-bottom:10px; text-align:center;'>Langkah-langkah melakukan kalibrasi :</p>
+        <ol style='font-size:12pt; line-height:1.5;'>
+            <li>Pasang PCB ke bracket</li>
+            <li>Jepit probe merah ke bracket</li>
+            <li>Jepit probe hitam ke mata pahat</li>
+            <li>Klik tombol "KAL" dan tunggu hingga kalibrasi selesai dilakukan</li>
+            <li>Proses kalibrasi tidak perlu menutup pintu body/casing</li>
+            <li>Lepas probe hitam setelah kalibrasi selesai dilakukan. Jangan melepas probe merah yang telah terpasang!</li>
+            <li>Tekan tombol "Jendela Utama" untuk masuk ke panel utama</li>
+        </ol>
+        """
+        lbl_instruksi = QLabel(instruksi)
+        lbl_instruksi.setWordWrap(True)
+        content_layout.addWidget(lbl_instruksi)
+
+        # Status & Progress (Mini, tidak terlalu mencolok agar mirip mockup)
+        self.lbl_status = QLabel("Menunggu aksi pengguna...")
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_status.setStyleSheet("color: blue; font-weight: bold;")
-        layout.addWidget(self.lbl_status)
+        self.lbl_status.setStyleSheet("color: blue; font-style: italic;")
+        content_layout.addWidget(self.lbl_status)
 
         self.progress = QProgressBar()
         self.progress.setValue(0)
-        layout.addWidget(self.progress)
+        self.progress.setFixedHeight(10)
+        content_layout.addWidget(self.progress)
 
-        self.btn_ok = QPushButton("OK - Masuk ke Panel Utama")
-        self.btn_ok.setEnabled(False)
-        self.btn_ok.clicked.connect(self.accept)
-        layout.addWidget(self.btn_ok)
+        content_layout.addSpacing(20)
 
-        self.btn_skip = QPushButton("Skip (Lewati Paksa)")
-        self.btn_skip.clicked.connect(self.force_mock_mode)
-        layout.addWidget(self.btn_skip)
+        # Tombol
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(50)
 
-        self.setLayout(layout)
+        self.btn_kal = QPushButton("KAL")
+        self.btn_kal.setFixedSize(200, 40)
+        self.btn_kal.setStyleSheet("background-color: #e6e6e6; border: none; font-weight: bold; font-size: 12px;")
+        self.btn_kal.clicked.connect(self.mulai_kalibrasi)
 
+        self.btn_main = QPushButton("Jendela Utama")
+        self.btn_main.setFixedSize(200, 40)
+        self.btn_main.setEnabled(False)  # Awalnya mati
+        self.btn_main.setStyleSheet("background-color: #a0a0a0; border: none; font-size: 12px;")
+        self.btn_main.clicked.connect(self.accept)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_kal)
+        btn_layout.addWidget(self.btn_main)
+        btn_layout.addStretch()
+
+        content_layout.addLayout(btn_layout)
+        layout.addLayout(content_layout)
+        layout.addStretch()
+
+        # Inisiasi Worker (Tapi belum dijalankan)
         self.worker = CalibrationWorker()
         self.worker.progress_update.connect(self.progress.setValue)
         self.worker.status_update.connect(self.lbl_status.setText)
         self.worker.finished_success.connect(self.on_success)
         self.worker.finished_mock.connect(self.on_mock)
+
+    def mulai_kalibrasi(self):
+        self.btn_kal.setEnabled(False)  # Matikan tombol KAL agar tidak diklik dua kali
+        self.btn_kal.setStyleSheet("background-color: #a0a0a0; border: none;")
         self.worker.start()
 
     def on_success(self, grbl, sensor):
         self.grbl_serial = grbl
         self.sensor_serial = sensor
         self.is_mock = False
-        self.btn_ok.setEnabled(True)
-        self.btn_ok.setStyleSheet("background-color: #00FF00; font-weight: bold;")
+
+        # Nyalakan tombol Jendela Utama
+        self.btn_main.setEnabled(True)
+        self.btn_main.setStyleSheet("background-color: #e6e6e6; border: none; font-weight: bold;")
 
     def on_mock(self):
         self.is_mock = True
-        self.btn_ok.setEnabled(True)
-        self.btn_ok.setStyleSheet("background-color: #00FF00; font-weight: bold;")
-
-    def force_mock_mode(self):
-        self.worker.stop()
-        self.on_mock()
-        self.progress.setValue(100)
+        # Nyalakan tombol Jendela Utama untuk mode simulasi
+        self.btn_main.setEnabled(True)
+        self.btn_main.setStyleSheet("background-color: #e6e6e6; border: none; font-weight: bold;")
 
     def closeEvent(self, event):
         self.worker.stop()
@@ -913,12 +1066,10 @@ class CNCApp(QMainWindow):
                                 "Mesin belum pernah dijalankan!\nSilakan lakukan proses milling terlebih dahulu.")
             return
 
-        # --- TAMBAHAN LOGIKA BARU MENCEGAH SAVE SAAT RUNNING ---
         if self.waktu_mulai and not self.waktu_selesai:
             QMessageBox.warning(self, "Peringatan",
                                 "Mesin sedang beroperasi!\nHarap tunggu hingga proses milling selesai (Done) atau dihentikan untuk menyimpan data.")
             return
-        # -------------------------------------------------------
 
         filepath, _ = QFileDialog.getSaveFileName(self, "Simpan Laporan", "Laporan_Milling_CNC.xlsx",
                                                   "Excel Files (*.xlsx)")
@@ -975,35 +1126,46 @@ class CNCApp(QMainWindow):
 if __name__ == '__main__':
     try:
         app = QApplication(sys.argv)
-        continue_program = True
 
-        while continue_program:
-            cal_dialog = CalibrationDialog()
-            if cal_dialog.exec() == QDialog.DialogCode.Accepted:
-                window = CNCApp(cal_dialog.grbl_serial, cal_dialog.sensor_serial, cal_dialog.is_mock)
-                restart_requested = [False]
+        # 1. TAMPILKAN LOGIN DIALOG DULU
+        login_dialog = LoginDialog()
+        if login_dialog.exec() == QDialog.DialogCode.Accepted:
+
+            # Jika Login sukses, masuk ke loop utama program
+            continue_program = True
+
+            while continue_program:
+                # 2. BUKA JENDELA KALIBRASI
+                cal_dialog = CalibrationDialog()
+                if cal_dialog.exec() == QDialog.DialogCode.Accepted:
+
+                    # 3. BUKA JENDELA UTAMA
+                    window = CNCApp(cal_dialog.grbl_serial, cal_dialog.sensor_serial, cal_dialog.is_mock)
+                    restart_requested = [False]
 
 
-                def handle_recalc_request():
-                    restart_requested[0] = True
-                    window.close()
+                    def handle_recalc_request():
+                        restart_requested[0] = True
+                        window.close()
 
 
-                window.request_recalibration.connect(handle_recalc_request)
-                window.show()
-                app.exec()
+                    window.request_recalibration.connect(handle_recalc_request)
+                    window.show()
+                    app.exec()
 
-                if restart_requested[0]:
-                    if hasattr(window, 'plot_window'): window.plot_window.close()
-                    del window
-                    continue
+                    if restart_requested[0]:
+                        if hasattr(window, 'plot_window'): window.plot_window.close()
+                        del window
+                        continue  # Mengulang loop ke CalibrationDialog
+                    else:
+                        continue_program = False
+                        break
+
                 else:
                     continue_program = False
                     break
-
-            else:
-                continue_program = False
-                break
+        else:
+            print("[SISTEM] Verifikasi dibatalkan pengguna.")
 
     except Exception as e:
         print(f"GAGAL MEMULAI APLIKASI: {e}")
