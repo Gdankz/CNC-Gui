@@ -4,6 +4,7 @@ import time  # Untuk mengatur jeda waktu (delay)
 import re  # Untuk mencari angka di dalam teks G-Code secara cerdas
 import os  # Untuk mengatur file di dalam sistem komputer (seperti menghapus gambar sementara)
 import datetime  # Untuk mengambil data jam dan tanggal hari ini
+import queue  # Untuk mengirim event sensor dengan aman antar-thread
 import openpyxl  # Untuk membuat dan mengedit file Excel
 from openpyxl.drawing.image import Image as ExcelImage  # Untuk memasukkan gambar ke dalam Excel
 
@@ -14,7 +15,7 @@ matplotlib.use('qtagg')  # Mengatur agar grafik bisa digabungkan dengan aplikasi
 # Mengimpor komponen-komponen untuk membuat antarmuka aplikasi (tombol, teks, kotak, dll)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QProgressBar, QMessageBox, QFileDialog, QDialog, QFrame,
-                             QSizePolicy, QLineEdit)
+                             QSizePolicy, QLineEdit, QGridLayout)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QPixmap, QColor
 
@@ -34,17 +35,74 @@ BAUD_RATE = 115200  # Kecepatan transfer data (harus sama dengan di program Ardu
 # 0. PEKERJA LATAR BELAKANG: PROSES KALIBRASI
 # Menggunakan QThread agar saat kalibrasi berjalan, aplikasi tidak macet/hang
 # ==========================================
+class CalibrationSensorReader(QThread):
+    """Membaca port sensor selama kalibrasi tanpa berebut dengan worker GRBL."""
+
+    def __init__(self, sensor):
+        super().__init__()
+        self.sensor = sensor
+        self.is_running = True
+        self.events = queue.Queue()
+        self.bracket_pernah_terpasang = False
+        self.bracket_terpasang = False
+        self.casing_tertutup = False
+
+    def proses_data(self, data):
+        if data == "LSBON":
+            self.bracket_pernah_terpasang = True
+            self.bracket_terpasang = True
+        elif data == "LSBOFF":
+            self.bracket_terpasang = False
+        elif data == "LSC_ON":
+            self.casing_tertutup = True
+        elif data == "LSC_OFF":
+            self.casing_tertutup = False
+        self.events.put(data)
+
+    def ambil_event(self, event_yang_dicari=None):
+        while True:
+            try:
+                data = self.events.get_nowait()
+            except queue.Empty:
+                return None
+            if event_yang_dicari is None or data in event_yang_dicari:
+                return data
+
+    def bersihkan_event(self):
+        while self.ambil_event() is not None:
+            pass
+
+    def run(self):
+        while self.is_running:
+            try:
+                if self.sensor.in_waiting:
+                    raw = self.sensor.readline().decode(errors="ignore").strip()
+                    if raw.startswith("#") and raw.endswith(";"):
+                        self.proses_data(raw[1:-1])
+                    self.sensor.write(b"ACK\n")
+                else:
+                    time.sleep(0.01)
+            except Exception as error:
+                print(f"Pembaca sensor kalibrasi berhenti: {error}")
+                return
+
+    def stop(self):
+        self.is_running = False
+
+
 class CalibrationWorker(QThread):
     # Sinyal-sinyal untuk lapor ke layar utama (update tulisan, nilai loading, dll)
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
     finished_success = pyqtSignal(object, object)
     finished_mock = pyqtSignal()
+    failed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self.grbl = None
         self.sensor = None
+        self.sensor_reader = None
         self.is_running = True
 
     # Fungsi khusus untuk mengirim perintah G-Code dasar ke mesin
@@ -52,29 +110,65 @@ class CalibrationWorker(QThread):
         print(f"> {cmd}")
         if self.grbl:
             self.grbl.write((cmd + '\n').encode())  # Ubah teks jadi kode mesin (bytes)
-            time.sleep(0.05)
-            # Kosongkan sisa balasan dari mesin agar tidak menumpuk
-            while self.grbl.in_waiting:
-                self.grbl.readline()
+            self.grbl.flush()
 
     # Menunggu mesin menjawab "ok", artinya mesin sudah selesai bergerak
-    def wait_grbl_ok(self):
-        while self.is_running:
+    def wait_grbl_ok(self, timeout_seconds=10):
+        deadline = time.monotonic() + timeout_seconds
+        while self.is_running and time.monotonic() < deadline:
+            if not self.bracket_aman():
+                return False
             try:
                 response = self.grbl.readline().decode(errors="ignore").strip()
-                if response.lower() == "ok": return True
-                if "error" in response.lower(): return False
-            except:
-                pass
+                if response.lower() == "ok":
+                    return True
+                if "error" in response.lower() or "alarm" in response.lower():
+                    print(f"GRBL gagal: {response}")
+                    return False
+            except Exception as error:
+                print(f"Gagal membaca GRBL: {error}")
+                return False
+            time.sleep(0.01)
+        return False
 
     # Fungsi untuk membaca kiriman data rahasia (#...;) dari Arduino sensor
-    def baca_sensor(self):
-        if self.sensor.in_waiting:
+    def baca_sensor(self, event_yang_dicari=None):
+        if self.sensor_reader:
+            return self.sensor_reader.ambil_event(event_yang_dicari)
+        while self.sensor.in_waiting:
             raw = self.sensor.readline().decode(errors="ignore").strip()
             # Jika teks diawali '#' dan diakhiri ';', buang simbol tersebut dan ambil isinya
             if raw.startswith("#") and raw.endswith(";"):
-                return raw[1:-1]
+                data = raw[1:-1]
+                if event_yang_dicari is None or data in event_yang_dicari:
+                    return data
         return None
+
+    def bracket_aman(self):
+        if (self.sensor_reader and self.sensor_reader.bracket_pernah_terpasang
+                and not self.sensor_reader.bracket_terpasang):
+            try:
+                self.grbl.write(b"!")
+                time.sleep(0.1)
+                self.grbl.write(b"\x18")
+            except Exception as error:
+                print(f"Gagal menghentikan GRBL saat bracket lepas: {error}")
+            self.is_running = False
+            self.gagal("Bracket PCB terlepas. Kalibrasi dihentikan.")
+            return False
+        return True
+
+    def stop_sensor_reader(self):
+        if self.sensor_reader:
+            self.sensor_reader.stop()
+            self.sensor_reader.wait(500)
+            self.sensor_reader = None
+
+    def gagal(self, pesan):
+        print(f"Kalibrasi gagal: {pesan}")
+        self.status_update.emit(pesan)
+        self.failed.emit(pesan)
+        self.stop_sensor_reader()
 
     # Misi utama yang dikerjakan oleh pekerja kalibrasi ini
     def run(self):
@@ -95,13 +189,17 @@ class CalibrationWorker(QThread):
         # JIKA MESIN ASLI TERHUBUNG:
         if not mock_mode:
             try:
+                self.sensor.reset_input_buffer()
+                self.sensor_reader = CalibrationSensorReader(self.sensor)
+                self.sensor_reader.start()
+
                 # 1. Pastikan PCB sudah dijepit
                 self.status_update.emit("Menunggu PCB Terpasang...")
                 self.progress_update.emit(10)
 
                 lsb_ok = False
                 while self.is_running and not lsb_ok:
-                    data = self.baca_sensor()
+                    data = self.baca_sensor({"LSBON"})
                     if data == "LSBON":  # Kode LSBON berarti limit switch bracket tertekan
                         lsb_ok = True
                     time.sleep(0.1)
@@ -113,7 +211,7 @@ class CalibrationWorker(QThread):
                 self.grbl.write(b"\r\n\r\n")
                 time.sleep(2)
                 self.grbl.flushInput()
-                self.sensor.reset_input_buffer()
+                self.sensor_reader.bersihkan_event()
 
                 # Buka kunci alarm ($X), pakai satuan mm (G21), pakai sistem maju pelan (G91)
                 self.kirim("$X");
@@ -126,6 +224,8 @@ class CalibrationWorker(QThread):
                 limx, limy, limz = False, False, False
 
                 while self.is_running:
+                    if not self.bracket_aman():
+                        return
                     # Buat perintah jalan pelan-pelan
                     move_cmd = "G1 "
                     if not limx: move_cmd += "X-2 "  # X gerak ke kiri
@@ -139,7 +239,7 @@ class CalibrationWorker(QThread):
                     time.sleep(0.05)
 
                     # Dengar teriakan sensor, adakah limit switch yang mentok?
-                    data = self.baca_sensor()
+                    data = self.baca_sensor({"LIMX", "LIMY", "LIMZ"})
                     if data == "LIMX":
                         limx = True
                         self.grbl.write(b'\x18');
@@ -169,37 +269,52 @@ class CalibrationWorker(QThread):
                         self.kirim("$X");
                         self.kirim("G21");
                         self.kirim("G91")
-                        self.sensor.reset_input_buffer()
+                        self.sensor_reader.bersihkan_event()
                         time.sleep(0.2)
                         break
 
                 if not self.is_running: return
+                if not self.bracket_aman(): return
 
                 # 4. Berpindah ke Titik Nol PCB yang Sebenarnya (Sumbu X)
                 self.status_update.emit("Geser X 37mm...")
                 self.progress_update.emit(50)
                 self.kirim("G91");
                 self.kirim("G1 X37 F300")  # Geser X sejauh 37mm
-                self.wait_grbl_ok()
+                if not self.wait_grbl_ok():
+                    if self.is_running:
+                        self.gagal("GRBL tidak mengonfirmasi pergeseran X.")
+                    return
                 self.kirim("G92 X0");
-                self.wait_grbl_ok()  # Anggap titik ini sebagai Titik Nol X (0)
+                if not self.wait_grbl_ok():
+                    if self.is_running:
+                        self.gagal("GRBL tidak mengonfirmasi titik nol X.")
+                    return
 
                 # 5. Berpindah ke Titik Nol PCB yang Sebenarnya (Sumbu Y)
                 self.status_update.emit("Geser Y 118mm...")
                 self.progress_update.emit(70)
                 self.kirim("G91");
                 self.kirim("G1 Y118 F300")  # Geser Y sejauh 118mm
-                self.wait_grbl_ok()
+                if not self.wait_grbl_ok():
+                    if self.is_running:
+                        self.gagal("GRBL tidak mengonfirmasi pergeseran Y.")
+                    return
                 self.kirim("G92 Y0");
-                self.wait_grbl_ok()  # Anggap titik ini sebagai Titik Nol Y (0)
+                if not self.wait_grbl_ok():
+                    if self.is_running:
+                        self.gagal("GRBL tidak mengonfirmasi titik nol Y.")
+                    return
 
                 # 6. Turunkan pahat berlahan sampai menyentuh PCB (Sumbu Z)
                 self.status_update.emit("Menyesuaikan Home Z (PCB Sentuh)...")
                 self.progress_update.emit(85)
-                self.sensor.reset_input_buffer()
+                self.sensor_reader.bersihkan_event()
                 while self.is_running:
+                    if not self.bracket_aman():
+                        return
                     self.kirim("G1 Z-2 F300")  # Pahat turun pelan-pelan
-                    data = self.baca_sensor()
+                    data = self.baca_sensor({"PCBON"})
                     if data == "PCBON":  # Sensor mendeteksi ada arus mengalir dari pahat ke PCB
                         self.grbl.write(b'\x18');
                         time.sleep(1)  # Berhenti mendadak!
@@ -209,7 +324,7 @@ class CalibrationWorker(QThread):
                         self.kirim("G92 Z0");
                         self.kirim("G1 Z0 F300")  # Kunci titik ini sebagai Titik Nol Z
                         time.sleep(0.5)
-                        self.sensor.reset_input_buffer()
+                        self.sensor_reader.bersihkan_event()
                         time.sleep(0.3)
                         break
 
@@ -230,7 +345,9 @@ class CalibrationWorker(QThread):
 
                 # Tunggu terus sampai ada laporan tombol start dipencet
                 while self.is_running:
-                    data = self.baca_sensor()
+                    if not self.bracket_aman():
+                        return
+                    data = self.baca_sensor({"START_ON"})
                     if data == "START_ON":
                         break
                     time.sleep(0.1)
@@ -239,12 +356,13 @@ class CalibrationWorker(QThread):
                 self.progress_update.emit(100)
 
                 # Kirim sinyal sukses dan oper kabel USB-nya ke layar utama
+                self.stop_sensor_reader()
                 self.finished_success.emit(self.grbl, self.sensor)
 
             except Exception as e:
                 # Jika di tengah jalan kabel kecabut
                 print(f"Kalibrasi Hardware Terputus: {e}")
-                self.finished_mock.emit()
+                self.gagal(f"Kalibrasi terputus: {e}")
         else:
             # JIKA TIDAK ADA MESIN (MODE SIMULASI UNTUK TESTING)
             if not self.is_running: return
@@ -258,6 +376,7 @@ class CalibrationWorker(QThread):
     # Fungsi untuk menghentikan paksa pekerja ini
     def stop(self):
         self.is_running = False
+        self.stop_sensor_reader()
 
 
 # ==========================================
@@ -370,6 +489,7 @@ class CalibrationDialog(QDialog):
         self.grbl_serial = None
         self.sensor_serial = None
         self.is_mock = False
+        self.calibration_active = False
 
         # Susunan tampilan (Sama seperti halaman login)
         layout = QVBoxLayout(self)
@@ -458,9 +578,12 @@ class CalibrationDialog(QDialog):
         self.worker.status_update.connect(self.lbl_status.setText)
         self.worker.finished_success.connect(self.on_success)
         self.worker.finished_mock.connect(self.on_mock)
+        self.worker.failed.connect(self.on_failure)
+        self.worker.finished.connect(self.on_worker_finished)
 
     def mulai_kalibrasi(self):
         # Kalau KAL diklik, matikan tombolnya biar user tidak klik dobel, lalu suruh pekerja lari
+        self.calibration_active = True
         self.btn_kal.setEnabled(False)
         self.btn_kal.setStyleSheet("background-color: #a0a0a0; border: none;")
         self.worker.start()
@@ -481,8 +604,19 @@ class CalibrationDialog(QDialog):
         self.btn_main.setEnabled(True)
         self.btn_main.setStyleSheet("background-color: #e6e6e6; border: none; font-weight: bold;")
 
+    def on_failure(self, pesan):
+        self.lbl_status.setText(pesan)
+        self.btn_kal.setEnabled(True)
+        self.btn_kal.setStyleSheet("background-color: #e6e6e6; border: none; font-weight: bold; font-size: 12px;")
+
+    def on_worker_finished(self):
+        self.calibration_active = False
+
     def closeEvent(self, event):
-        self.worker.stop()
+        if self.calibration_active or self.worker.isRunning():
+            self.lbl_status.setText("Kalibrasi sedang berjalan. Jendela tidak dapat ditutup.")
+            event.ignore()
+            return
         event.accept()
 
 
