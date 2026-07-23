@@ -5,6 +5,7 @@ import re  # Untuk mencari angka di dalam teks G-Code secara cerdas
 import os  # Untuk mengatur file di dalam sistem komputer (seperti menghapus gambar sementara)
 import datetime  # Untuk mengambil data jam dan tanggal hari ini
 import queue  # Untuk mengirim event sensor dengan aman antar-thread
+from pathlib import Path
 import openpyxl  # Untuk membuat dan mengedit file Excel
 from openpyxl.drawing.image import Image as ExcelImage  # Untuk memasukkan gambar ke dalam Excel
 
@@ -29,6 +30,7 @@ from matplotlib.figure import Figure
 PORT_GRBL = 'COM12'  # Colokan USB yang menuju ke Arduino penggerak mesin (GRBL)
 PORT_SENSOR = 'COM9'  # Colokan USB yang menuju ke Arduino pembaca sensor (AR3)
 BAUD_RATE = 115200  # Kecepatan transfer data (harus sama dengan di program Arduino)
+DEFAULT_GCODE_FILE = Path(__file__).with_name("KotakSaja-B_Cu.gbr_iso_combined_cnc_flatcam.txt")
 
 
 # ==========================================
@@ -310,12 +312,14 @@ class CalibrationWorker(QThread):
                 self.status_update.emit("Menyesuaikan Home Z (PCB Sentuh)...")
                 self.progress_update.emit(85)
                 self.sensor_reader.bersihkan_event()
+                pcb_tersentuh = False
                 while self.is_running:
                     if not self.bracket_aman():
                         return
                     self.kirim("G1 Z-2 F300")  # Pahat turun pelan-pelan
                     data = self.baca_sensor({"PCBON"})
                     if data == "PCBON":  # Sensor mendeteksi ada arus mengalir dari pahat ke PCB
+                        pcb_tersentuh = True
                         self.grbl.write(b'\x18');
                         time.sleep(1)  # Berhenti mendadak!
                         self.kirim("$X");
@@ -329,10 +333,12 @@ class CalibrationWorker(QThread):
                         break
 
                 if not self.is_running: return
+                if not pcb_tersentuh:
+                    self.gagal("Probe belum menyentuh PCB; kalibrasi tidak dapat diselesaikan.")
+                    return
 
-                # 7. Menunggu tombol START fisik ditekan oleh operator
-                self.status_update.emit("Kalibrasi Selesai! Tekan Tombol START di panel mesin.")
-                self.progress_update.emit(95)
+                # 7. Kembalikan mesin ke pengaturan normal tanpa menunggu START fisik.
+                self.status_update.emit("Kalibrasi selesai. Mulai program dari Jendela Utama.")
 
                 # Kembalikan mesin ke pengaturan normal (Koordinat Absolut)
                 self.kirim("$X");
@@ -342,18 +348,6 @@ class CalibrationWorker(QThread):
                 self.kirim("G94")
                 self.kirim("G92 X0 Y0 Z0");
                 self.wait_grbl_ok()
-
-                # Tunggu terus sampai ada laporan tombol start dipencet
-                while self.is_running:
-                    if not self.bracket_aman():
-                        return
-                    data = self.baca_sensor({"START_ON"})
-                    if data == "START_ON":
-                        break
-                    time.sleep(0.1)
-
-                self.status_update.emit("START Ditekan! Mesin Siap Beroperasi.")
-                self.progress_update.emit(100)
 
                 # Kirim sinyal sukses dan oper kabel USB-nya ke layar utama
                 self.stop_sensor_reader()
@@ -540,12 +534,6 @@ class CalibrationDialog(QDialog):
         self.lbl_status.setStyleSheet("color: blue; font-style: italic;")
         content_layout.addWidget(self.lbl_status)
 
-        # Loading bar kalibrasi (Sengaja dibuat tipis sesuai gambar asli)
-        self.progress = QProgressBar()
-        self.progress.setValue(0)
-        self.progress.setFixedHeight(10)
-        content_layout.addWidget(self.progress)
-
         content_layout.addSpacing(20)
 
         # Tombol Navigasi Bawah
@@ -574,7 +562,6 @@ class CalibrationDialog(QDialog):
 
         # Siapkan pekerja latar belakang (Tapi belum disuruh lari)
         self.worker = CalibrationWorker()
-        self.worker.progress_update.connect(self.progress.setValue)
         self.worker.status_update.connect(self.lbl_status.setText)
         self.worker.finished_success.connect(self.on_success)
         self.worker.finished_mock.connect(self.on_mock)
@@ -769,6 +756,25 @@ class GRBLWorker(QThread):
         homing_sequence = ["G21", "G90", "G00 Z3.000", "G00 X0 Y0", "G00 Z0.000"]
         self.gcode_lines = homing_sequence + lines
 
+    def wait_until_idle(self, timeout_seconds=120):
+        """Tunggu sampai GRBL benar-benar berhenti bergerak sebelum menyatakan milling selesai."""
+        deadline = time.monotonic() + timeout_seconds
+        while self.is_running and time.monotonic() < deadline:
+            try:
+                self.grbl_serial.write(b"?\n")
+                response = self.grbl_serial.readline().decode('utf-8', errors='ignore').strip()
+            except Exception as error:
+                print(f"Gagal membaca status akhir GRBL: {error}")
+                return False
+            if response:
+                print(f"<< {response}")
+            if response.startswith("<Idle"):
+                return True
+            if "error" in response.lower() or "alarm" in response.lower():
+                return False
+            time.sleep(0.1)
+        return False
+
     def run(self):
         self.is_running = True
         self.status_update.emit('<i>On Progress</i>')
@@ -832,13 +838,15 @@ class GRBLWorker(QThread):
             self.progress_update.emit(persentase)
 
         # Kalau prosesnya selesai normal sampai akhir file
-        if self.is_running:
+        if self.is_running and (self.mock_mode or self.wait_until_idle()):
             if not self.mock_mode:
                 try:
                     self.sensor_serial.write(b"#MILLING_SELESAI;\n")  # Minta Arduino Sensor bunyikan lagu beres!
                 except:
                     pass
             self.status_update.emit("<i>Done</i>")
+        elif self.is_running:
+            self.status_update.emit("<i>GRBL belum Idle; proses belum dinyatakan selesai.</i>")
 
     def stop(self):
         self.is_running = False
@@ -1071,7 +1079,7 @@ class CNCApp(QMainWindow):
             QPushButton:hover { background-color: #8c8c8c; }
             QPushButton:pressed { background-color: #737373; }
         """
-        btn_load = QPushButton("Jendela Jalur PCB")
+        btn_load = QPushButton("MULAI PROGRAM")
         btn_load.setStyleSheet(btn_style)
         btn_load.clicked.connect(self.load_and_start)
 
@@ -1175,9 +1183,9 @@ class CNCApp(QMainWindow):
                 self.request_recalibration.emit()  # Lempar sinyal buat restart ke Jendela Kalibrasi
             return
 
-        # Buka folder cari teks G-Code
-        filepath, _ = QFileDialog.getOpenFileName(self, "Pilih File G-Code", "", "Text Files (*.txt);;All Files (*)")
-        if filepath:
+        # Program milling sudah ditetapkan agar operator tidak perlu memilih file lagi.
+        filepath = DEFAULT_GCODE_FILE
+        if filepath.is_file():
             # Re-Inisiasi pekerja kalau kebetulan dia lagi tidur
             if not self.grbl_thread.isRunning():
                 old_mock = self.grbl_thread.mock_mode
@@ -1215,6 +1223,8 @@ class CNCApp(QMainWindow):
 
             # PECUT pekerja GRBL, "AYO JALAN!"
             self.grbl_thread.start()
+        else:
+            QMessageBox.critical(self, "Program Tidak Ditemukan", f"File G-Code tidak ditemukan:\n{filepath}")
 
     # Fungsi menerima lapor status loading dari pekerja untuk dipasang ke grafik GUI
     def update_progress(self, val):
